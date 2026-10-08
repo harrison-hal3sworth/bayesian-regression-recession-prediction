@@ -1,0 +1,2065 @@
+---
+title: "Final Project - Modeling GDP to Predict Recession"
+author: "Harrison Halesworth"
+date: "2026-03-23"
+output: pdf_document
+---
+
+# 1.) Setup
+
+## Package Installation and Setup
+```{r}
+# install.packages("quantmod")
+# install.packages("cli")
+# install.packages(c("readr", "pracma", "devtools"))
+# devtools::install_github("cykbennie/fbi")
+library(fbi)
+library(lmtest)
+library(sandwich)
+library(runjags)
+library(coda)
+library(MASS)
+```
+## Load in Data with fbi Package
+```{r}
+# Load in data from 1959-2025
+qd <- fredqd(
+  file = "./current.csv",
+  date_start = as.Date("1959-12-01"),
+  date_end   = as.Date("2025-12-01"),
+  transform  = FALSE
+)
+
+# Keep variables mentioned in proposal
+# date - quarter date of observation (YYYY-MM-DD)
+# GDPC1 - Real Gross Domestic Product ($B)
+# UNRATE - Civilian Unemployment Rate (%)
+# CPIAUCSL - Consumer Price Index for all Urban Consumers (1982-1984=100)
+# GS10 - 10-Year Treasury Constant Maturity Rate (%)
+# TB3MS -  3-Month Treasury Bill Secondary Market Rate (%)
+vars <- c("date", "GDPC1", "UNRATE", "CPIAUCSL", "INDPRO", "GS10", "TB3MS")
+df <- qd[, vars]
+
+# Rename variables after log transformations
+df$gdp_growth <- c(NA, diff(log(df$GDPC1)))
+df$inflation  <- c(NA, diff(log(df$CPIAUCSL)))
+df$ip_growth  <- c(NA, diff(log(df$INDPRO)))
+
+# Calculate treasury yield spread
+df$spread     <-df$GS10 - df$TB3MS
+
+# Calculate lag variables (values from previous quarter)
+df$lag_gdp_growth <- c(NA, head(df$gdp_growth, -1))
+df$lag_unrate     <- c(NA, head(df$UNRATE, -1))
+df$lag_inflation  <- c(NA, head(df$inflation, -1))
+df$lag_ip_growth  <- c(NA, head(df$ip_growth, -1))
+df$lag_spread     <- c(NA, head(df$spread, -1))
+
+df_final <- na.omit(df[, c(
+  "date", "gdp_growth", "lag_gdp_growth", "lag_unrate",
+  "lag_inflation", "lag_ip_growth", "lag_spread"
+)])
+
+# Inspect data
+head(df_final)
+summary(df_final)
+nrow(df_final)
+```
+
+
+# 2.) EDA
+
+## Plots of variables
+
+### Quarterly GDP Growth
+```{r}
+# Plot quarterly GDP growth
+plot(df_final$date, df_final$gdp_growth,
+     main="Quarterly GDP Growth",
+     xlab="Quarter",
+     ylab="GDP Growth",
+     pch=19)
+
+# Add average line
+abline(h=mean(df_final$gdp_growth),
+       col="red",
+       lty=2)
+```
+### Quarterly Unemployment Rate (lagged)
+```{r}
+# Plot quarterly Unemployment Rate
+plot(df_final$date, df_final$lag_unrate,
+     main="Quarterly Unemployment Rate",
+     xlab="Quarter",
+     ylab="Unemployment Rate",
+     pch=19)
+
+# Add average line
+abline(h=mean(df_final$lag_unrate),
+       col="red",
+       lty=2)
+```
+### Quarterly Inflation (lagged)
+```{r}
+# Plot quarterly Inflation
+plot(df_final$date, df_final$lag_inflation,
+     main="Quarterly Inflation",
+     xlab="Quarter",
+     ylab="Inflation",
+     pch=19)
+
+# Add average line
+abline(h=mean(df_final$lag_inflation),
+       col="red",
+       lty=2)
+```
+### Quarterly Industrial Production Growth (lagged)
+```{r}
+# Plot quarterly Industrial Production Growth
+plot(df_final$date, df_final$lag_ip_growth,
+     main="Quarterly Industrial Production Growth",
+     xlab="Quarter",
+     ylab="Industrial Production Growth",
+     pch=19)
+
+# Add average line
+abline(h=mean(df_final$lag_ip_growth),
+       col="red",
+       lty=2)
+```
+### Quarterly Yield Spread (lagged)
+```{r}
+# Plot quarterly Yield Spread
+plot(df_final$date, df_final$lag_spread,
+     main="Quarterly Yield Spread",
+     xlab="Quarter",
+     ylab="Yield Spread",
+     pch=19)
+
+# Add average line
+abline(h=mean(df_final$lag_spread),
+       col="red",
+       lty=2)
+```
+
+## Summary Stats
+```{r}
+# Summary stats for variables
+summary(df_final)
+```
+
+# 3.) Frequentist Model
+
+## Fit OLS Model
+```{r}
+# Extract variable names
+X_names <- colnames(df_final)
+X_names <- X_names[3:ncol(df_final)]
+formula <- as.formula(paste("gdp_growth ~", paste(X_names, collapse = " + ")))
+
+# Scale data for regression
+df_final_scaled <- as.data.frame(scale(df_final[,-1]))
+
+# Use lm() to fit OLS model for gdp growth
+freq_mod <- lm(formula, data=df_final_scaled)
+
+# Summary of OLS model
+summary(freq_mod)
+```
+## OLS Model Diagnostics
+
+### Heteroskedasticity
+```{r}
+# Plot residuals
+plot(freq_mod, which = 1)
+```
+```{r}
+# Perform BP-Test on model
+bptest(freq_mod)
+```
+
+### Normality of Residuals
+```{r}
+# Inspect normality of residuals
+qqnorm(freq_mod$residuals, main = "QQ Plot of Residuals")
+qqline(freq_mod$residuals)
+```
+
+```{r}
+# Inspect normality of residuals with Shapiro-Wilk Test
+shapiro.test(resid(freq_mod))
+```
+## Remarks
+Residual diagnostics suggest mild deviations from normality, particularly in the tails, and evidence of heteroskedasticity. Given the nature of macroeconomic data, these findings are expected. To address potential heteroskedasticity, robust standard errors were employed in inference.
+
+## Robust Standard Errors
+```{r}
+# Robust Standard Errors to deal with heteroskedasticity
+coeftest(freq_mod, vcov = vcovHC(freq_mod, type = "HC1"))
+```
+## Probability of Negative GDP Growth
+For this part, we want to compute:
+
+$$
+P(Y_t<0\:|\:X_t)
+$$
+
+Where $Y_t$ is GDP growth. We will do this with unscaled data.
+
+Our model implies:
+
+$$
+Y_t\approx{}N(\hat{\mu}_t,\hat{\sigma}^2)
+$$
+Where $\hat{\mu}_t$ is the fitted regression value, and $\hat{\sigma}$ is the residual standard error.
+
+From this, we have:
+
+$$
+P(Y_t<0)=\Phi{}\left( \frac{0-\hat{\mu}_t}{\hat{\sigma}} \right)
+$$
+Which we can use pnorm() to calculate.
+
+```{r}
+# Fit unscaled model
+freq_mod_unscaled <- lm(formula, data = df_final)
+
+# Make predictions with uncertainty
+pred <- predict(freq_mod_unscaled, newdata = df_final, se.fit = TRUE)
+
+# Store values to use for pnorm()
+mu_hat <- pred$fit
+se_mu <- pred$se.fit
+sigma_hat <- sigma(freq_mod_unscaled)
+
+# Calculate predictive SD for each observation
+pred_sd <- sqrt(se_mu^2 + sigma_hat^2)
+
+# Calculate probability of negative GDP growth
+recession_prob <- pnorm(0, mean = mu_hat, sd = pred_sd)
+
+# Attach results to df
+df_final$pred_gdp_growth <- mu_hat
+df_final$pred_sd <- pred_sd
+df_final$recession_prob <- recession_prob
+
+# Inspect results
+head(df_final[, c("date", "gdp_growth", "pred_gdp_growth", "pred_sd", "recession_prob")])
+
+# Plot probability over time
+plot(df_final$date, df_final$recession_prob,
+     type = "l",
+     lwd = 2,
+     main = "Frequentist Estimated Probability of Negative GDP Growth",
+     xlab = "Quarter",
+     ylab = "Probability")
+
+# Add vertical lines for key quarters
+abline(v = as.Date(c(
+  "2001-03-01",
+  "2002-03-01",
+  "2007-03-01",
+  "2009-03-01",
+  "2020-03-01",
+  "2021-03-01"
+)), col = "blue", lty = 2)
+```
+
+```{r}
+# Set seed for predictive checking
+set.seed(123)
+
+# Define constants
+S <- 5000
+N <- nrow(df_final)
+
+# Calculate fitted values and standard error
+mu_hat <- fitted(freq_mod_unscaled)
+sigma_hat <- sigma(freq_mod_unscaled)
+
+# Define storage matrix for predictions
+y_rep_freq <- matrix(NA, nrow = N, ncol = S)
+
+# Draw replications of our frequentist model
+for (s in 1:S) {
+  y_rep_freq[, s] <- rnorm(N, mean = mu_hat, sd = sigma_hat)
+}
+```
+
+```{r}
+# Observed summary statistics
+obs_mean <- mean(df_final$gdp_growth)
+obs_sd <- sd(df_final$gdp_growth)
+obs_min <- min(df_final$gdp_growth)
+
+# Simulated summary statistics
+sim_means <- apply(y_rep_freq, 2, mean)
+sim_sds <- apply(y_rep_freq, 2, sd)
+sim_mins <- apply(y_rep_freq, 2, min)
+
+# Plot simulated means vs observed mean
+hist(sim_means,
+     breaks = 40,
+     main = "Frequentist Predictive Check: Mean GDP Growth",
+     xlab = "Simulated Mean GDP Growth")
+
+abline(v = obs_mean, col = "red", lwd = 2)
+
+legend("topright",
+       legend = "Observed Mean",
+       col = "red",
+       lwd = 2,
+       bty = "n")
+```
+
+```{r}
+# Plot simulated standard deviations vs observed standard deviation
+hist(sim_sds,
+     breaks = 40,
+     main = "Frequentist Predictive Check: SD of GDP Growth",
+     xlab = "Simulated SD of GDP Growth")
+
+abline(v = obs_sd, col = "red", lwd = 2)
+
+legend("topright",
+       legend = "Observed SD",
+       col = "red",
+       lwd = 2,
+       bty = "n")
+```
+
+
+```{r}
+# Plot simulated minimums vs observed minimum
+hist(sim_mins,
+     breaks = 40,
+     main = "Frequentist Predictive Check: Extreme Negative GDP Growth",
+     xlab = "Simulated Minimum GDP Growth")
+
+abline(v = obs_min, col = "red", lwd = 2)
+
+legend("topright",
+       legend = "Observed Minimum",
+       col = "red",
+       lwd = 2,
+       bty = "n")
+```
+
+```{r}
+# Count how many negative GDP quarters are observed
+obs_negative_count <- sum(df_final$gdp_growth < 0)
+
+# Count how many negative GDP quarters occur in each simulation
+sim_negative_counts <- apply(y_rep_freq, 2, function(y) sum(y < 0))
+
+hist(sim_negative_counts,
+     breaks = 40,
+     main = "Frequentist Predictive Check: Negative GDP Quarters",
+     xlab = "Number of Simulated Negative GDP Quarters")
+
+abline(v = obs_negative_count, col = "red", lwd = 2)
+
+legend("topright",
+       legend = "Observed Count",
+       col = "red",
+       lwd = 2,
+       bty = "n")
+```
+```{r}
+freq_pred_check_table <- data.frame(
+  Statistic = c("Mean GDP Growth",
+                "SD GDP Growth",
+                "Minimum GDP Growth",
+                "Negative GDP Quarters"),
+  
+  Observed = c(obs_mean,
+               obs_sd,
+               obs_min,
+               obs_negative_count),
+  
+  Simulated_Mean = c(mean(sim_means),
+                     mean(sim_sds),
+                     mean(sim_mins),
+                     mean(sim_negative_counts)),
+  
+  Simulated_2.5 = c(quantile(sim_means, 0.025),
+                    quantile(sim_sds, 0.025),
+                    quantile(sim_mins, 0.025),
+                    quantile(sim_negative_counts, 0.025)),
+  
+  Simulated_97.5 = c(quantile(sim_means, 0.975),
+                     quantile(sim_sds, 0.975),
+                     quantile(sim_mins, 0.975),
+                     quantile(sim_negative_counts, 0.975))
+)
+
+knitr::kable(freq_pred_check_table,
+             digits = 4,
+             caption = "Frequentist predictive check comparing observed GDP growth to simulated data")
+```
+```{r}
+# Use the same cutoff as your Bayesian PPC / t-model check
+extreme_cutoff <- -0.02
+
+# Observed count
+obs_extreme_neg <- sum(df_final$gdp_growth < extreme_cutoff)
+
+# Simulated counts from existing y_rep_freq matrix
+sim_extreme_neg <- apply(y_rep_freq, 2, function(y) {
+  sum(y < extreme_cutoff)
+})
+
+# Plot simulated counts vs observed count
+hist(sim_extreme_neg,
+     breaks = 30,
+     main = "Frequentist Predictive Check: Extreme Negative GDP Quarters",
+     xlab = paste("Number of quarters with GDP growth <", extreme_cutoff))
+
+abline(v = obs_extreme_neg, col = "red", lwd = 2)
+
+legend("topright",
+       legend = paste("Observed =", obs_extreme_neg),
+       col = "red",
+       lwd = 2,
+       bty = "n")
+
+# Predictive p-value style comparison
+freq_extreme_p <- mean(sim_extreme_neg >= obs_extreme_neg)
+
+# Summary table
+freq_extreme_table <- data.frame(
+  Statistic = "Extreme negative GDP quarters",
+  Cutoff = extreme_cutoff,
+  Observed = obs_extreme_neg,
+  Simulated_Mean = mean(sim_extreme_neg),
+  Simulated_2.5 = quantile(sim_extreme_neg, 0.025),
+  Simulated_97.5 = quantile(sim_extreme_neg, 0.975),
+  Predictive_P_Value = freq_extreme_p
+)
+
+knitr::kable(freq_extreme_table,
+             digits = 4,
+             caption = "Frequentist predictive check for extreme negative GDP quarters")
+```
+
+
+# 4.) Bayesian Model
+## Model Definition
+We define our Bayesian model as such:
+
+$$
+y_t\sim{}N(\mu_t,\sigma)
+$$
+
+$$
+\mu_t=\beta_0+\beta_1X_{t-1}
+$$
+We have weakly informative priors of:
+
+$$
+\beta_j\sim{}N(0,5)
+$$
+## JAGS on Unscaled Data
+
+### JAGS Setup
+```{r}
+# Model String for Bayesian MLR
+modelString <- "
+model {
+## sampling
+for (i in 1:N) {
+    mu[i] <- beta_0 +
+             beta_gdp * lag_gdp[i] +
+             beta_unrate * lag_unrate[i] +
+             beta_inflation * lag_inflation[i] +
+             beta_ip * lag_ip[i] +
+             beta_spread * lag_spread[i]
+             
+  y[i] ~ dnorm(mu[i], tau)
+}
+  
+## priors
+beta_0          ~ dnorm(mu0, g0)
+beta_gdp       ~ dnorm(mu1, g1)
+beta_unrate    ~ dnorm(mu2, g2)
+beta_inflation ~ dnorm(mu3, g3)
+beta_ip        ~ dnorm(mu4, g4)
+beta_spread    ~ dnorm(mu5, g5)
+sigma ~ dt(mu_sigma, tau_sigma, nu_sigma) T(0, upper_sigma)
+tau <- pow(sigma, -2)
+}
+"
+
+# Pass data and hyperparameter values
+y <- as.vector(df_final$gdp_growth)
+lag_gdp <- as.vector(df_final$lag_gdp)
+lag_unrate <- as.vector(df_final$lag_unrate)
+lag_inflation <- as.vector(df_final$lag_inflation)
+lag_ip <- as.vector(df_final$lag_ip)
+lag_spread <- as.vector(df_final$lag_spread)
+
+N <- length(y)
+
+mu_sigma <- 0
+nu_sigma <- 1
+upper_sigma <- 1000000
+
+the_data <- list(
+  y = y,
+  lag_gdp = lag_gdp,
+  lag_unrate = lag_unrate,
+  lag_inflation = lag_inflation,
+  lag_ip = lag_ip,
+  lag_spread = lag_spread,
+  N = N,
+  mu0 = 0, g0 = 1/25,
+  mu1 = 0, g1 = 1/25,
+  mu2 = 0, g2 = 1/25,
+  mu3 = 0, g3 = 1/25,
+  mu4 = 0, g4 = 1/25,
+  mu5 = 0, g5 = 1/25,
+  mu_sigma = 0,
+  tau_sigma = 1/25,
+  nu_sigma = 1,
+  upper_sigma = 1e6
+)
+
+initsfunction <- function(chain){
+  return(list(
+    .RNG.seed = 100 + chain,
+    .RNG.name = "base::Mersenne-Twister"
+  ))
+}
+
+posterior_MLR <- run.jags(modelString,
+                      n.chains = 3,
+                      data = the_data,
+                      monitor = c("beta_0", "beta_gdp", "beta_unrate",
+                                  "beta_inflation", "beta_ip", "beta_spread",
+                                  "sigma"),
+                      adapt = 2000,
+                      burnin = 10000,
+                      sample = 10000,
+                      thin = 50,
+                      inits = initsfunction)
+```
+```{r}
+# Print summary
+summary(posterior_MLR)
+```
+### Diagnostic Plots
+```{r}
+# Diagnostic plots for beta_gdp
+plot(posterior_MLR, vars = "beta_gdp")
+```
+```{r}
+# Diagnostic plots for beta_unrate
+plot(posterior_MLR, vars = "beta_unrate")
+```
+```{r}
+# Diagnostic plots for beta_inflation
+plot(posterior_MLR, vars = "beta_inflation")
+```
+```{r}
+# Diagnostic plots for beta_ip
+plot(posterior_MLR, vars = "beta_ip")
+```
+```{r}
+# Diagnostic plot for beta_spread
+plot(posterior_MLR, vars = "beta_spread")
+```
+```{r}
+# Diagnostic plot for sigma
+plot(posterior_MLR, vars = "sigma")
+```
+### Interepretation and Inference
+
+## Jags on Scaled Data
+
+### JAGS Setup
+```{r}
+# Model String for Bayesian MLR
+modelStringScaled <- "
+model {
+## sampling
+for (i in 1:N) {
+    mu[i] <- beta_0 +
+             beta_gdp * lag_gdp[i] +
+             beta_unrate * lag_unrate[i] +
+             beta_inflation * lag_inflation[i] +
+             beta_ip * lag_ip[i] +
+             beta_spread * lag_spread[i]
+             
+  y[i] ~ dnorm(mu[i], tau)
+}
+  
+## priors
+beta_0          ~ dnorm(mu0, g0)
+beta_gdp       ~ dnorm(mu1, g1)
+beta_unrate    ~ dnorm(mu2, g2)
+beta_inflation ~ dnorm(mu3, g3)
+beta_ip        ~ dnorm(mu4, g4)
+beta_spread    ~ dnorm(mu5, g5)
+sigma ~ dt(mu_sigma, tau_sigma, nu_sigma) T(0, upper_sigma)
+tau <- pow(sigma, -2)
+}
+"
+
+# Pass data and hyperparameter values
+y <- as.vector(df_final_scaled$gdp_growth)
+lag_gdp <- as.vector(df_final_scaled$lag_gdp)
+lag_unrate <- as.vector(df_final_scaled$lag_unrate)
+lag_inflation <- as.vector(df_final_scaled$lag_inflation)
+lag_ip <- as.vector(df_final_scaled$lag_ip)
+lag_spread <- as.vector(df_final_scaled$lag_spread)
+
+N <- length(y)
+
+mu_sigma <- 0
+nu_sigma <- 1
+upper_sigma <- 1000000
+
+the_data <- list(
+  y = y,
+  lag_gdp = lag_gdp,
+  lag_unrate = lag_unrate,
+  lag_inflation = lag_inflation,
+  lag_ip = lag_ip,
+  lag_spread = lag_spread,
+  N = N,
+  mu0 = 0, g0 = 1,
+  mu1 = 0, g1 = 1,
+  mu2 = 0, g2 = 1,
+  mu3 = 0, g3 = 1,
+  mu4 = 0, g4 = 1,
+  mu5 = 0, g5 = 1,
+  mu_sigma = 0,
+  tau_sigma = 1,
+  nu_sigma = 1,
+  upper_sigma = 1e6
+)
+
+initsfunction <- function(chain){
+  return(list(
+    .RNG.seed = 100 + chain,
+    .RNG.name = "base::Mersenne-Twister"
+  ))
+}
+
+posterior_MLR_scaled <- run.jags(modelStringScaled,
+                      n.chains = 3,
+                      data = the_data,
+                      monitor = c("beta_0", "beta_gdp", "beta_unrate",
+                                  "beta_inflation", "beta_ip", "beta_spread",
+                                  "sigma"),
+                      adapt = 2000,
+                      burnin = 10000,
+                      sample = 10000,
+                      thin = 10,
+                      inits = initsfunction)
+```
+```{r}
+# Print summary
+summary(posterior_MLR_scaled)
+```
+### Diagnostic Plots
+```{r}
+# Diagnostic plots for beta_gdp
+plot(posterior_MLR_scaled, vars = "beta_gdp")
+```
+```{r}
+# Diagnostic plots for beta_unrate
+plot(posterior_MLR_scaled, vars = "beta_unrate")
+```
+```{r}
+# Diagnostic plots for beta_inflation
+plot(posterior_MLR_scaled, vars = "beta_inflation")
+```
+```{r}
+# Diagnostic plots for beta_ip
+plot(posterior_MLR_scaled, vars = "beta_ip")
+```
+```{r}
+# Diagnostic plot for beta_spread
+plot(posterior_MLR_scaled, vars = "beta_spread")
+```
+```{r}
+# Diagnostic plot for sigma
+plot(posterior_MLR_scaled, vars = "sigma")
+```
+
+### Interpretation and inference
+
+For both of our JAGS simulations, each of our monitored parameters seemingly converges to a stable distribution.
+
+## Probability of Negative GDP Growth (with unscaled data)
+
+```{r}
+# Convert posterior results to matrix
+post <- as.matrix(as.mcmc(posterior_MLR))
+
+# Extract predictor values from data
+X <- model.matrix(~ lag_gdp_growth + lag_unrate + lag_inflation +
+                    lag_ip_growth + lag_spread, data = df_final)
+
+# Create vector of coeffecient draws
+beta_draws <- cbind(post[, "beta_0"],
+                    post[, "beta_gdp"],
+                    post[, "beta_unrate"],
+                    post[, "beta_inflation"],
+                    post[, "beta_ip"],
+                    post[, "beta_spread"])
+
+# Calculate mu response
+mu_post <- beta_draws %*% t(X)
+
+# Create posterior sigma draws vector
+sigma_post <- post[, "sigma"]
+
+# Calculate probability of negative GDP growth
+bayes_prob_neg <- sapply(1:ncol(mu_post), function(j) {
+  mean(pnorm(0, mean = mu_post[, j], sd = sigma_post))
+})
+
+# Store results in dataframe
+df_final$bayes_prob_neg <- bayes_prob_neg
+```
+
+```{r}
+# Plot probability over time
+plot(df_final$date, df_final$bayes_prob_neg, type="l", lwd=2,
+     main="Bayesian Posterior Probability of Negative GDP Growth",
+     xlab="Quarter", ylab="Probability")
+
+# Add vertical lines for key quarters
+abline(v = as.Date(c(
+  "2001-03-01",
+  "2002-03-01",
+  "2007-03-01",
+  "2009-03-01",
+  "2020-03-01",
+  "2021-03-01"
+)), col = "blue", lty = 2)
+```
+
+
+# 5.) Full Model Comparison
+
+## Coefficient Estimates
+```{r}
+# Obtain frequentist robust results from scaled model
+robust_vcov <- vcovHC(freq_mod, type = "HC1")
+robust_test <- coeftest(freq_mod, vcov = robust_vcov)
+
+# Extract estimates, se, p-values, and interval bounds
+freq_est <- robust_test[, "Estimate"]
+freq_se  <- robust_test[, "Std. Error"]
+freq_p   <- robust_test[, "Pr(>|t|)"]
+freq_lower <- freq_est - 1.96 * freq_se
+freq_upper <- freq_est + 1.96 * freq_se
+
+# Convert Bayesian posterior draws to matrix
+post_scaled <- as.matrix(as.mcmc(posterior_MLR_scaled))
+
+# Define vector of param names
+bayes_params <- c("beta_0", "beta_gdp", "beta_unrate",
+                  "beta_inflation", "beta_ip", "beta_spread")
+
+# Calculate mean, lower, and upper bounds from Bayesian Posterior draws
+bayes_mean  <- apply(post_scaled[, bayes_params], 2, mean)
+bayes_lower <- apply(post_scaled[, bayes_params], 2, quantile, probs = 0.025)
+bayes_upper <- apply(post_scaled[, bayes_params], 2, quantile, probs = 0.975)
+
+# Construct table comparing frequentist and Bayesian results
+comparison_table <- data.frame(
+  Variable = c("(Intercept)", "lag_gdp_growth", "lag_unrate",
+               "lag_inflation", "lag_ip_growth", "lag_spread"),
+  Freq_Estimate = as.numeric(freq_est),
+  Freq_Robust_SE = as.numeric(freq_se),
+  Freq_95CI_Lower = as.numeric(freq_lower),
+  Freq_95CI_Upper = as.numeric(freq_upper),
+  Freq_pvalue = as.numeric(freq_p),
+  Bayes_Mean = c(bayes_mean["beta_0"],
+                 bayes_mean["beta_gdp"],
+                 bayes_mean["beta_unrate"],
+                 bayes_mean["beta_inflation"],
+                 bayes_mean["beta_ip"],
+                 bayes_mean["beta_spread"]),
+  Bayes_95CrI_Lower = c(bayes_lower["beta_0"],
+                        bayes_lower["beta_gdp"],
+                        bayes_lower["beta_unrate"],
+                        bayes_lower["beta_inflation"],
+                        bayes_lower["beta_ip"],
+                        bayes_lower["beta_spread"]),
+  Bayes_95CrI_Upper = c(bayes_upper["beta_0"],
+                        bayes_upper["beta_gdp"],
+                        bayes_upper["beta_unrate"],
+                        bayes_upper["beta_inflation"],
+                        bayes_upper["beta_ip"],
+                        bayes_upper["beta_spread"])
+)
+
+# Display table
+knitr::kable(comparison_table,
+             digits = 4,
+             caption = "Frequentist and Bayesian coefficient comparison (scaled data)")
+```
+
+## Recession Probabilities
+```{r}
+# Plot frequentist vs. Bayesian recession probabilities
+plot(df_final$date, df_final$recession_prob,
+     type = "l", lwd = 2,
+     ylim = range(c(df_final$recession_prob, df_final$bayes_prob_neg), na.rm = TRUE),
+     main = "Estimated Probability of Negative GDP Growth",
+     xlab = "Quarter",
+     ylab = "Probability")
+
+# Insert vertical lines corresponding to recession periods
+lines(df_final$date, df_final$bayes_prob_neg, lwd = 2, lty = 2)
+abline(v = as.Date(c("2001-03-01", "2002-03-01",
+                     "2007-03-01", "2009-03-01",
+                     "2020-03-01", "2021-03-01")),
+       col = "gray60", lty = 3)
+
+# Define legend
+legend("topright",
+       legend = c("Frequentist", "Bayesian"),
+       lwd = 2,
+       lty = c(1, 2),
+       bty = "n")
+```
+
+```{r}
+# Compute correlation between frequentist and Bayesian probabilities
+prob_correlation <- cor(df_final$recession_prob, df_final$bayes_prob_neg, use = "complete.obs")
+mean_abs_diff <- mean(abs(df_final$recession_prob - df_final$bayes_prob_neg), na.rm = TRUE)
+
+# Create summary table with correlation and MAD
+prob_summary <- data.frame(
+  Metric = c("Correlation", "Mean Absolute Difference"),
+  Value = c(prob_correlation, mean_abs_diff)
+)
+
+# Display table
+knitr::kable(prob_summary,
+             digits = 4,
+             caption = "Comparison of frequentist and Bayesian recession probabilities")
+```
+
+## Predictive Fit
+```{r}
+# Compute frequentist fit metrics
+freq_rmse <- sqrt(mean((df_final$gdp_growth - df_final$pred_gdp_growth)^2, na.rm = TRUE))
+freq_mae  <- mean(abs(df_final$gdp_growth - df_final$pred_gdp_growth), na.rm = TRUE)
+
+# Compute Bayesian posterior mean fitted values
+post_unscaled <- as.matrix(as.mcmc(posterior_MLR))
+
+# Extract unscaled predictor variables
+X_unscaled <- model.matrix(~ lag_gdp_growth + lag_unrate + lag_inflation +
+                             lag_ip_growth + lag_spread,
+                           data = df_final)
+
+# Put together unscaled draws
+beta_draws_unscaled <- cbind(
+  post_unscaled[, "beta_0"],
+  post_unscaled[, "beta_gdp"],
+  post_unscaled[, "beta_unrate"],
+  post_unscaled[, "beta_inflation"],
+  post_unscaled[, "beta_ip"],
+  post_unscaled[, "beta_spread"]
+)
+
+# Compute mu and predicted means
+mu_post_unscaled <- beta_draws_unscaled %*% t(X_unscaled)
+bayes_pred_mean <- colMeans(mu_post_unscaled)
+
+# Insert results into data
+df_final$bayes_pred_gdp_growth <- bayes_pred_mean
+
+# Calculate Bayesian fit metrics
+bayes_rmse <- sqrt(mean((df_final$gdp_growth - df_final$bayes_pred_gdp_growth)^2, na.rm = TRUE))
+bayes_mae  <- mean(abs(df_final$gdp_growth - df_final$bayes_pred_gdp_growth), na.rm = TRUE)
+
+# Create comparison table for metrics
+fit_comparison <- data.frame(
+  Model = c("Frequentist", "Bayesian"),
+  RMSE = c(freq_rmse, bayes_rmse),
+  MAE  = c(freq_mae, bayes_mae)
+)
+
+# Display table
+knitr::kable(fit_comparison,
+             digits = 5,
+             caption = "Predictive fit comparison on unscaled GDP growth")
+```
+
+# 6.) Other Bayesian Models
+
+## t-distributed error model
+```{r}
+# Model string for t distributed errors
+modelString_t <- "
+model {
+
+  for (i in 1:N) {
+    mu[i] <- beta_0 +
+             beta_gdp * lag_gdp[i] +
+             beta_unrate * lag_unrate[i] +
+             beta_inflation * lag_inflation[i] +
+             beta_ip * lag_ip[i] +
+             beta_spread * lag_spread[i]
+
+    y[i] ~ dt(mu[i], tau, nu)
+  }
+
+  # Priors for coefficients
+  beta_0         ~ dnorm(0, 1)
+  beta_gdp       ~ dnorm(0, 1)
+  beta_unrate    ~ dnorm(0, 1)
+  beta_inflation ~ dnorm(0, 1)
+  beta_ip        ~ dnorm(0, 1)
+  beta_spread    ~ dnorm(0, 1)
+
+  # Prior for sigma
+  sigma ~ dunif(0, 10)
+  tau <- pow(sigma, -2)
+
+  # Prior for degrees of freedom
+  nu_minus_two ~ dexp(1/30)
+  nu <- nu_minus_two + 2
+}
+"
+
+# Pass data and hyperparameter values
+y <- as.vector(df_final_scaled$gdp_growth)
+lag_gdp <- as.vector(df_final_scaled$lag_gdp_growth)
+lag_unrate <- as.vector(df_final_scaled$lag_unrate)
+lag_inflation <- as.vector(df_final_scaled$lag_inflation)
+lag_ip <- as.vector(df_final_scaled$lag_ip_growth)
+lag_spread <- as.vector(df_final_scaled$lag_spread)
+
+N <- length(y)
+
+the_data_t <- list(
+  y = y,
+  lag_gdp = lag_gdp,
+  lag_unrate = lag_unrate,
+  lag_inflation = lag_inflation,
+  lag_ip = lag_ip,
+  lag_spread = lag_spread,
+  N = N
+)
+
+initsfunction_t <- function(chain) {
+  list(
+    .RNG.seed = 200 + chain,
+    .RNG.name = "base::Mersenne-Twister",
+    sigma = 1,
+    nu_minus_two = 10
+  )
+}
+
+posterior_t <- run.jags(
+  model = modelString_t,
+  n.chains = 3,
+  data = the_data_t,
+  monitor = c("beta_0", "beta_gdp", "beta_unrate",
+              "beta_inflation", "beta_ip", "beta_spread",
+              "sigma", "nu"),
+  adapt = 2000,
+  burnin = 10000,
+  sample = 10000,
+  thin = 10,
+  inits = initsfunction_t
+)
+
+summary(posterior_t)
+```
+
+```{r}
+# Plot gianostic plots
+plot(posterior_t, vars = c("beta_gdp", "beta_unrate", "beta_inflation",
+                           "beta_ip", "beta_spread", "sigma", "nu"))
+```
+
+```{r}
+# Convert posterior draws to matrix
+post_t <- as.matrix(as.mcmc(posterior_t))
+
+# Define vector of param names
+t_params <- c("beta_0", "beta_gdp", "beta_unrate",
+              "beta_inflation", "beta_ip", "beta_spread", "sigma", "nu")
+
+# Compute mean, upper and lower bounds
+t_mean  <- apply(post_t[, t_params], 2, mean)
+t_lower <- apply(post_t[, t_params], 2, quantile, probs = 0.025)
+t_upper <- apply(post_t[, t_params], 2, quantile, probs = 0.975)
+
+# Create summary table
+t_summary_table <- data.frame(
+  Parameter = t_params,
+  Mean = t_mean,
+  CrI_2.5 = t_lower,
+  CrI_97.5 = t_upper
+)
+
+# Display table
+knitr::kable(
+  t_summary_table,
+  digits = 4,
+  caption = "Posterior summary for Bayesian regression with Student-t errors"
+)
+```
+
+```{r}
+# Design matrix for scaled predictors
+X_scaled <- model.matrix(
+  ~ lag_gdp_growth + lag_unrate + lag_inflation + lag_ip_growth + lag_spread,
+  data = df_final_scaled
+)
+
+# Combine coeffecient draws
+beta_draws_t <- cbind(
+  post_t[, "beta_0"],
+  post_t[, "beta_gdp"],
+  post_t[, "beta_unrate"],
+  post_t[, "beta_inflation"],
+  post_t[, "beta_ip"],
+  post_t[, "beta_spread"]
+)
+
+# Compute mu and draw mean
+mu_post_t <- beta_draws_t %*% t(X_scaled)
+t_pred_mean <- colMeans(mu_post_t)
+
+# Store results
+df_final$t_bayes_pred_scaled <- t_pred_mean
+```
+
+```{r}
+# Define model string for unscaled t model
+modelString_t_unscaled <- "
+model {
+
+  for (i in 1:N) {
+    mu[i] <- beta_0 +
+             beta_gdp * lag_gdp[i] +
+             beta_unrate * lag_unrate[i] +
+             beta_inflation * lag_inflation[i] +
+             beta_ip * lag_ip[i] +
+             beta_spread * lag_spread[i]
+
+    y[i] ~ dt(mu[i], tau, nu)
+  }
+
+  beta_0         ~ dnorm(0, 1/25)
+  beta_gdp       ~ dnorm(0, 1/25)
+  beta_unrate    ~ dnorm(0, 1/25)
+  beta_inflation ~ dnorm(0, 1/25)
+  beta_ip        ~ dnorm(0, 1/25)
+  beta_spread    ~ dnorm(0, 1/25)
+
+  sigma ~ dunif(0, 0.1)
+  tau <- pow(sigma, -2)
+
+  nu_minus_two ~ dexp(1/30)
+  nu <- nu_minus_two + 2
+}
+"
+
+# Pass data and hyperparameter values
+y <- as.vector(df_final$gdp_growth)
+lag_gdp <- as.vector(df_final$lag_gdp_growth)
+lag_unrate <- as.vector(df_final$lag_unrate)
+lag_inflation <- as.vector(df_final$lag_inflation)
+lag_ip <- as.vector(df_final$lag_ip_growth)
+lag_spread <- as.vector(df_final$lag_spread)
+
+N <- length(y)
+
+the_data_t_unscaled <- list(
+  y = y,
+  lag_gdp = lag_gdp,
+  lag_unrate = lag_unrate,
+  lag_inflation = lag_inflation,
+  lag_ip = lag_ip,
+  lag_spread = lag_spread,
+  N = N
+)
+
+initsfunction_t_unscaled <- function(chain) {
+  list(
+    .RNG.seed = 200 + chain,
+    .RNG.name = "base::Mersenne-Twister",
+    sigma = 0.01,
+    nu_minus_two = 10
+  )
+}
+
+posterior_t_unscaled <- run.jags(
+  model = modelString_t_unscaled,
+  n.chains = 3,
+  data = the_data_t_unscaled,
+  monitor = c("beta_0", "beta_gdp", "beta_unrate",
+              "beta_inflation", "beta_ip", "beta_spread",
+              "sigma", "nu"),
+  adapt = 2000,
+  burnin = 10000,
+  sample = 10000,
+  thin = 10,
+  inits = initsfunction_t_unscaled,
+  method = "parallel"
+)
+
+# Give summary of draws
+summary(posterior_t_unscaled)
+
+# Convert results to matrix form
+post_t_unscaled <- as.matrix(as.mcmc(posterior_t_unscaled))
+
+# Create design matrix for unscaled data
+X_unscaled <- model.matrix(
+  ~ lag_gdp_growth + lag_unrate + lag_inflation + lag_ip_growth + lag_spread,
+  data = df_final
+)
+
+# Combine coefficient draws
+beta_draws_t_unscaled <- cbind(
+  post_t_unscaled[, "beta_0"],
+  post_t_unscaled[, "beta_gdp"],
+  post_t_unscaled[, "beta_unrate"],
+  post_t_unscaled[, "beta_inflation"],
+  post_t_unscaled[, "beta_ip"],
+  post_t_unscaled[, "beta_spread"]
+)
+
+# Compute and extract desired params
+mu_draws_t <- beta_draws_t_unscaled %*% t(X_unscaled)
+sigma_draws_t <- post_t_unscaled[, "sigma"]
+nu_draws_t <- post_t_unscaled[, "nu"]
+
+# PCompute posterior probability of negative GDP growth for each quarter
+bayes_t_prob_neg <- sapply(1:ncol(mu_draws_t), function(j) {
+  mean(pt((0 - mu_draws_t[, j]) / sigma_draws_t, df = nu_draws_t))
+})
+
+# Store results
+df_final$bayes_t_prob_neg <- bayes_t_prob_neg
+```
+```{r}
+# Plot diagnostic plots of simulation
+plot(posterior_t_unscaled, vars = c("beta_gdp", "beta_unrate", "beta_inflation",
+                           "beta_ip", "beta_spread", "sigma", "nu"))
+```
+
+```{r}
+# Convert results to matrix form
+post_t_scaled <- as.matrix(as.mcmc(posterior_t))
+
+# Define vector of params
+t_params <- c("beta_0", "beta_gdp", "beta_unrate",
+              "beta_inflation", "beta_ip", "beta_spread")
+
+# Compute mean and upper and lower bounds
+t_mean  <- apply(post_t_scaled[, t_params], 2, mean)
+t_lower <- apply(post_t_scaled[, t_params], 2, quantile, 0.025)
+t_upper <- apply(post_t_scaled[, t_params], 2, quantile, 0.975)
+
+# Create table
+t_table <- data.frame(
+  Parameter = t_params,
+  Mean = t_mean,
+  CrI_2.5 = t_lower,
+  CrI_97.5 = t_upper
+)
+
+# Display table
+knitr::kable(t_table,
+             digits = 4,
+             caption = "Posterior summary for t-error Bayesian model (scaled data)")
+```
+
+```{r}
+# Plot recession probabilities via frequentist, normal bayesian, t bayesian
+plot(df_final$date, df_final$recession_prob,
+     type = "l", lwd = 2,
+     ylim = range(c(df_final$recession_prob,
+                    df_final$bayes_prob_neg,
+                    df_final$bayes_t_prob_neg), na.rm = TRUE),
+     main = "Recession Probability Comparison",
+     xlab = "Quarter",
+     ylab = "Probability")
+
+lines(df_final$date, df_final$bayes_prob_neg, lwd = 2, lty = 2, col = "red")
+lines(df_final$date, df_final$bayes_t_prob_neg, lwd = 2, lty = 3, col = "purple")
+
+# Insert vertical lines corresponding to recession periods
+# abline(v = as.Date(c("2001-03-01", "2002-03-01",
+#                     "2007-03-01", "2009-03-01",
+#                     "2020-03-01", "2021-03-01")),
+#       col = "blue", lty = 3)
+
+legend("topright",
+       legend = c("Frequentist", "Bayesian Normal", "Bayesian t"),
+       lwd = 2,
+       lty = c(1,2,3),
+       bty = "n")
+```
+```{r}
+# t-model predictions and accuracy
+t_rmse <- sqrt(mean((df_final$gdp_growth - df_final$t_bayes_pred)^2, na.rm = TRUE))
+t_mae  <- mean(abs(df_final$gdp_growth - df_final$t_bayes_pred), na.rm = TRUE)
+
+# Create table
+fit_table <- data.frame(
+  Model = c("Frequentist", "Bayesian Normal", "Bayesian t"),
+  RMSE = c(freq_rmse, bayes_rmse, t_rmse),
+  MAE  = c(freq_mae, bayes_mae, t_mae)
+)
+
+# Display table
+knitr::kable(fit_table,
+             digits = 5,
+             caption = "Predictive fit comparison across models")
+```
+
+## Reduced model
+
+```{r}
+# Define reduced model predictors via robust regression
+reduced_vars <- c("lag_inflation", "lag_ip_growth")
+```
+
+```{r}
+# Reduced formula on scaled data
+reduced_formula <- as.formula(
+  paste("gdp_growth ~", paste(reduced_vars, collapse = " + "))
+)
+
+# Fit reduced frequentist model on scaled data
+freq_mod_reduced <- lm(reduced_formula, data = df_final_scaled)
+
+# Display summary
+summary(freq_mod_reduced)
+
+# Robust SE results
+robust_vcov_reduced <- vcovHC(freq_mod_reduced, type = "HC1")
+robust_test_reduced <- coeftest(freq_mod_reduced, vcov = robust_vcov_reduced)
+
+# Display results
+robust_test_reduced
+```
+
+```{r}
+# Store reduced regression metrics
+freq_red_est <- robust_test_reduced[, "Estimate"]
+freq_red_se  <- robust_test_reduced[, "Std. Error"]
+freq_red_p   <- robust_test_reduced[, "Pr(>|t|)"]
+freq_red_lo  <- freq_red_est - 1.96 * freq_red_se
+freq_red_hi  <- freq_red_est + 1.96 * freq_red_se
+
+# Create metrics table
+freq_reduced_table <- data.frame(
+  Variable = rownames(robust_test_reduced),
+  Estimate = as.numeric(freq_red_est),
+  Robust_SE = as.numeric(freq_red_se),
+  CI_Lower = as.numeric(freq_red_lo),
+  CI_Upper = as.numeric(freq_red_hi),
+  P_Value = as.numeric(freq_red_p)
+)
+
+# Display table
+knitr::kable(
+  freq_reduced_table,
+  digits = 4,
+  caption = "Reduced frequentist model with robust standard errors"
+)
+```
+
+```{r}
+# Fit reduced frequentist model on unscaled data
+freq_mod_reduced_unscaled <- lm(reduced_formula, data = df_final)
+
+# Display summary
+summary(freq_mod_reduced_unscaled)
+
+# Predict with model
+pred_red <- predict(freq_mod_reduced_unscaled, newdata = df_final, se.fit = TRUE)
+
+# Calculate desired values from predictions
+mu_hat_red <- pred_red$fit
+se_mu_red  <- pred_red$se.fit
+sigma_hat_red <- sigma(freq_mod_reduced_unscaled)
+pred_sd_red <- sqrt(se_mu_red^2 + sigma_hat_red^2)
+
+# Probability of negative GDP growth
+recession_prob_red <- pnorm(0, mean = mu_hat_red, sd = pred_sd_red)
+
+# Store in dataframe
+df_final$pred_gdp_growth_red <- mu_hat_red
+df_final$pred_sd_red <- pred_sd_red
+df_final$recession_prob_red <- recession_prob_red
+```
+
+```{r}
+# Calculate error metrics
+freq_red_rmse <- sqrt(mean((df_final$gdp_growth - df_final$pred_gdp_growth_red)^2, na.rm = TRUE))
+freq_red_mae  <- mean(abs(df_final$gdp_growth - df_final$pred_gdp_growth_red), na.rm = TRUE)
+
+# Store in table
+freq_red_fit <- data.frame(
+  Model = "Frequentist Reduced",
+  RMSE = freq_red_rmse,
+  MAE = freq_red_mae
+)
+
+# Display table
+knitr::kable(
+  freq_red_fit,
+  digits = 5,
+  caption = "Predictive fit for reduced frequentist model"
+)
+```
+
+```{r}
+# Define model string for reduced version of Bayesian normal
+modelString_reduced <- "
+model {
+
+  for (i in 1:N) {
+    mu[i] <- beta_0 +
+             beta_inflation * lag_inflation[i] +
+             beta_ip * lag_ip[i]
+
+    y[i] ~ dnorm(mu[i], tau)
+  }
+
+  beta_0         ~ dnorm(0, 1/25)
+  beta_inflation ~ dnorm(0, 1/25)
+  beta_ip        ~ dnorm(0, 1/25)
+
+  sigma ~ dt(0, 1/25, 1) T(0, 1.0E6)
+  tau <- pow(sigma, -2)
+}
+"
+
+# Pass data and hyperparameter values
+y <- as.vector(df_final$gdp_growth)
+lag_inflation <- as.vector(df_final$lag_inflation)
+lag_ip <- as.vector(df_final$lag_ip_growth)
+
+N <- length(y)
+
+the_data_reduced <- list(
+  y = y,
+  lag_inflation = lag_inflation,
+  lag_ip = lag_ip,
+  N = N
+)
+
+initsfunction_reduced <- function(chain) {
+  list(
+    .RNG.seed = 300 + chain,
+    .RNG.name = "base::Mersenne-Twister"
+  )
+}
+
+posterior_reduced <- run.jags(
+  model = modelString_reduced,
+  n.chains = 3,
+  data = the_data_reduced,
+  monitor = c("beta_0", "beta_inflation", "beta_ip", "sigma"),
+  adapt = 2000,
+  burnin = 10000,
+  sample = 10000,
+  thin = 10,
+  inits = initsfunction_reduced,
+  method = "parallel"
+)
+
+summary(posterior_reduced)
+```
+```{r}
+# Plot diagnostic plots
+plot(posterior_reduced, vars = c("beta_inflation",
+                           "beta_ip", "sigma"))
+```
+
+
+```{r}
+# Define model stirng for reduced normal Bayesian model on unscaled data
+modelString_reduced_scaled <- "
+model {
+
+  for (i in 1:N) {
+    mu[i] <- beta_0 +
+             beta_inflation * lag_inflation[i] +
+             beta_ip * lag_ip[i]
+
+    y[i] ~ dnorm(mu[i], tau)
+  }
+
+  beta_0         ~ dnorm(0, 1)
+  beta_inflation ~ dnorm(0, 1)
+  beta_ip        ~ dnorm(0, 1)
+
+  sigma ~ dt(0, 1, 1) T(0, 1.0E6)
+  tau <- pow(sigma, -2)
+}
+"
+
+# Pass data and hyperparameter values
+y <- as.vector(df_final_scaled$gdp_growth)
+lag_inflation <- as.vector(df_final_scaled$lag_inflation)
+lag_ip <- as.vector(df_final_scaled$lag_ip_growth)
+
+N <- length(y)
+
+the_data_reduced_scaled <- list(
+  y = y,
+  lag_inflation = lag_inflation,
+  lag_ip = lag_ip,
+  N = N
+)
+
+posterior_reduced_scaled <- run.jags(
+  model = modelString_reduced_scaled,
+  n.chains = 3,
+  data = the_data_reduced_scaled,
+  monitor = c("beta_0", "beta_inflation", "beta_ip", "sigma"),
+  adapt = 2000,
+  burnin = 10000,
+  sample = 10000,
+  thin = 10,
+  inits = initsfunction_reduced,
+  method = "parallel"
+)
+
+summary(posterior_reduced_scaled)
+```
+
+```{r}
+# Plot diagnostic plots
+plot(posterior_reduced_scaled, vars = c("beta_inflation",
+                           "beta_ip", "sigma"))
+```
+
+
+```{r}
+# Convert draws to matrix form
+post_red_scaled <- as.matrix(as.mcmc(posterior_reduced_scaled))
+
+# Define vector of reduced params
+red_params <- c("beta_0", "beta_inflation", "beta_ip", "sigma")
+
+# Compute mean, upper and lower bounds
+red_mean  <- apply(post_red_scaled[, red_params], 2, mean)
+red_lower <- apply(post_red_scaled[, red_params], 2, quantile, probs = 0.025)
+red_upper <- apply(post_red_scaled[, red_params], 2, quantile, probs = 0.975)
+
+# Create result table
+bayes_reduced_table <- data.frame(
+  Parameter = red_params,
+  Mean = red_mean,
+  CrI_2.5 = red_lower,
+  CrI_97.5 = red_upper
+)
+
+# Display table
+knitr::kable(
+  bayes_reduced_table,
+  digits = 4,
+  caption = "Posterior summary for reduced Bayesian model"
+)
+```
+
+```{r}
+# Convert draws to matrix form
+post_red_unscaled <- as.matrix(as.mcmc(posterior_reduced))
+
+# Define design matrix
+X_red <- model.matrix(~ lag_inflation + lag_ip_growth, data = df_final)
+
+# Combine coefficient draws
+beta_draws_red <- cbind(
+  post_red_unscaled[, "beta_0"],
+  post_red_unscaled[, "beta_inflation"],
+  post_red_unscaled[, "beta_ip"]
+)
+
+# Compute and extract desired params
+mu_post_red <- beta_draws_red %*% t(X_red)
+sigma_post_red <- post_red_unscaled[, "sigma"]
+
+# Create table for results
+bayes_prob_neg_red <- sapply(1:ncol(mu_post_red), function(j) {
+  mean(pnorm(0, mean = mu_post_red[, j], sd = sigma_post_red))
+})
+
+# Store results in dataframe
+df_final$bayes_prob_neg_red <- bayes_prob_neg_red
+```
+
+```{r}
+# Compute posterior means
+bayes_pred_mean_red <- colMeans(mu_post_red)
+
+# Store predicted GDP growth in dataframe
+df_final$bayes_pred_gdp_growth_red <- bayes_pred_mean_red
+
+# Compute error metrics
+bayes_red_rmse <- sqrt(mean((df_final$gdp_growth - df_final$bayes_pred_gdp_growth_red)^2, na.rm = TRUE))
+bayes_red_mae  <- mean(abs(df_final$gdp_growth - df_final$bayes_pred_gdp_growth_red), na.rm = TRUE)
+
+# Create table
+bayes_red_fit <- data.frame(
+  Model = "Bayesian Reduced",
+  RMSE = bayes_red_rmse,
+  MAE = bayes_red_mae
+)
+
+# Display table
+knitr::kable(
+  bayes_red_fit,
+  digits = 5,
+  caption = "Predictive fit for reduced Bayesian model"
+)
+```
+
+```{r}
+# Create table
+reduced_fit_comparison <- data.frame(
+  Model = c("Frequentist Reduced", "Bayesian Reduced"),
+  RMSE = c(freq_red_rmse, bayes_red_rmse),
+  MAE  = c(freq_red_mae, bayes_red_mae)
+)
+
+# Display table
+knitr::kable(
+  reduced_fit_comparison,
+  digits = 5,
+  caption = "Reduced-model predictive fit comparison"
+)
+```
+
+```{r}
+# Plot probability of negative GDP growth for frequentist vs. Bayesian for reduced models
+plot(df_final$date, df_final$recession_prob_red,
+     type = "l", lwd = 2,
+     col = "black",
+     ylim = range(c(df_final$recession_prob_red, df_final$bayes_prob_neg_red), na.rm = TRUE),
+     main = "Reduced Model Recession Probability Comparison",
+     xlab = "Quarter",
+     ylab = "Probability")
+
+lines(df_final$date, df_final$bayes_prob_neg_red,
+      lwd = 2, lty = 2, col = "red")
+
+legend("topright",
+       legend = c("Frequentist Reduced", "Bayesian Reduced"),
+       col = c("black", "red"),
+       lwd = 2,
+       lty = c(1, 2),
+       bty = "n")
+```
+### Comparison of ALL Models
+```{r}
+# Plot probabilities of negative GDP growth of all models
+plot(df_final$date, df_final$recession_prob,
+     type = "l", lwd = 2,
+     col = "black",
+     ylim = range(c(
+       df_final$recession_prob,
+       df_final$bayes_prob_neg,
+       df_final$bayes_t_prob_neg,
+       df_final$recession_prob_red,
+       df_final$bayes_prob_neg_red
+     ), na.rm = TRUE),
+     main = "Recession Probability Comparison Across All Models",
+     xlab = "Quarter",
+     ylab = "Probability")
+
+# Full models
+lines(df_final$date, df_final$bayes_prob_neg,
+      col = "red", lwd = 2, lty = 2)
+
+lines(df_final$date, df_final$bayes_t_prob_neg,
+      col = "blue", lwd = 2, lty = 3)
+
+# Reduced models
+lines(df_final$date, df_final$recession_prob_red,
+      col = "darkgreen", lwd = 2, lty = 4)
+
+lines(df_final$date, df_final$bayes_prob_neg_red,
+      col = "purple", lwd = 2, lty = 5)
+
+legend("topleft",
+       legend = c(
+         "Frequentist (Full)",
+         "Bayesian Normal (Full)",
+         "Bayesian t (Full)",
+         "Frequentist (Reduced)",
+         "Bayesian Normal (Reduced)"
+       ),
+       col = c("black", "red", "blue", "darkgreen", "purple"),
+       lwd = 2,
+       lty = c(1,2,3,4,5),
+       bty = "n",
+       cex = 0.6)
+```
+## Rolling Bayesian Model (shifting window)
+
+```{r}
+# Define constants for simulation
+window_size <- 80
+n_total <- nrow(df_final)
+total_windows <- n_total - window_size + 1
+
+# Initialize dataframe for results
+rolling_results <- data.frame()
+
+# Define progress bar
+pb <- txtProgressBar(min = 0, max = total_windows, style = 3)
+
+# Loop through all windows and perform JAGS simulation
+for (start_idx in 1:total_windows) {
+
+  # Track progress through bar
+  setTxtProgressBar(pb, start_idx)
+  cat(sprintf("  Window %d of %d\r", start_idx, total_windows))
+
+  # Define end index
+  end_idx <- start_idx + window_size - 1
+  df_window <- df_final[start_idx:end_idx, ]
+
+  # Extract windowed data for each predictor and response
+  y_win <- as.vector(df_window$gdp_growth)
+  lag_gdp_win <- as.vector(df_window$lag_gdp_growth)
+  lag_unrate_win <- as.vector(df_window$lag_unrate)
+  lag_inflation_win <- as.vector(df_window$lag_inflation)
+  lag_ip_win <- as.vector(df_window$lag_ip_growth)
+  lag_spread_win <- as.vector(df_window$lag_spread)
+
+  the_data_win <- list(
+    y = y_win,
+    lag_gdp = lag_gdp_win,
+    lag_unrate = lag_unrate_win,
+    lag_inflation = lag_inflation_win,
+    lag_ip = lag_ip_win,
+    lag_spread = lag_spread_win,
+    N = length(y_win),
+    mu0 = 0, g0 = 1/25,
+    mu1 = 0, g1 = 1/25,
+    mu2 = 0, g2 = 1/25,
+    mu3 = 0, g3 = 1/25,
+    mu4 = 0, g4 = 1/25,
+    mu5 = 0, g5 = 1/25,
+    mu_sigma = 0,
+    tau_sigma = 1/25,
+    nu_sigma = 1,
+    upper_sigma = 1e6
+  )
+
+  fit_win <- NULL
+
+  # Try catch to remedy invalid model run
+  tryCatch(
+    {
+      capture.output(
+        fit_win <- run.jags(
+          model = modelString,
+          n.chains = 2,
+          data = the_data_win,
+          monitor = c("beta_gdp", "beta_unrate", "beta_inflation", "beta_ip", "beta_spread"),
+          adapt = 1000,
+          burnin = 3000,
+          sample = 3000,
+          thin = 5,
+          inits = initsfunction,
+          method = "rjags",
+          summarise = TRUE
+        ),
+        file = NULL
+      )
+    },
+    error = function(e) {
+      message(sprintf("\nWindow %d failed: %s", start_idx, e$message))
+    }
+  )
+
+  if (is.null(fit_win)) {
+    next
+  }
+
+  # Store summary
+  summ <- summary(fit_win)
+
+  # Format results in dataframe
+  rolling_results <- rbind(
+    rolling_results,
+    data.frame(
+      end_date = df_window$date[nrow(df_window)],
+
+      beta_gdp_mean = summ["beta_gdp", "Mean"],
+      beta_gdp_low = summ["beta_gdp", "Lower95"],
+      beta_gdp_high = summ["beta_gdp", "Upper95"],
+
+      beta_unrate_mean = summ["beta_unrate", "Mean"],
+      beta_unrate_low = summ["beta_unrate", "Lower95"],
+      beta_unrate_high = summ["beta_unrate", "Upper95"],
+
+      beta_inflation_mean = summ["beta_inflation", "Mean"],
+      beta_inflation_low = summ["beta_inflation", "Lower95"],
+      beta_inflation_high = summ["beta_inflation", "Upper95"],
+
+      beta_ip_mean = summ["beta_ip", "Mean"],
+      beta_ip_low = summ["beta_ip", "Lower95"],
+      beta_ip_high = summ["beta_ip", "Upper95"],
+
+      beta_spread_mean = summ["beta_spread", "Mean"],
+      beta_spread_low = summ["beta_spread", "Lower95"],
+      beta_spread_high = summ["beta_spread", "Upper95"]
+    )
+  )
+}
+
+close(pb)
+cat("\nDone.\n")
+```
+
+```{r}
+# Plot rolling coefficient value plot for Inflation
+plot(rolling_results$end_date, rolling_results$beta_inflation_mean,
+     type = "l", lwd = 2,
+     ylim = range(c(rolling_results$beta_inflation_low,
+                    rolling_results$beta_inflation_high)),
+     main = "Rolling Bayesian Estimate: Inflation Effect",
+     xlab = "Window End Date",
+     ylab = "Posterior Mean")
+
+lines(rolling_results$end_date, rolling_results$beta_inflation_low, lty = 2)
+lines(rolling_results$end_date, rolling_results$beta_inflation_high, lty = 2)
+abline(h = 0, lty = 3)
+```
+
+```{r}
+# Plot rolling coefficient value plot for IP
+plot(rolling_results$end_date, rolling_results$beta_ip_mean,
+     type = "l", lwd = 2,
+     ylim = range(c(rolling_results$beta_ip_low,
+                    rolling_results$beta_ip_high)),
+     main = "Rolling Bayesian Estimate: Industrial Production Effect",
+     xlab = "Window End Date",
+     ylab = "Posterior Mean")
+
+lines(rolling_results$end_date, rolling_results$beta_ip_low, lty = 2)
+lines(rolling_results$end_date, rolling_results$beta_ip_high, lty = 2)
+abline(h = 0, lty = 3)
+```
+```{r}
+# Plot rolling coefficient value plot for Unemployment
+plot(rolling_results$end_date, rolling_results$beta_unrate_mean,
+     type = "l", lwd = 2,
+     ylim = range(c(rolling_results$beta_unrate_low,
+                    rolling_results$beta_unrate_high), na.rm = TRUE),
+     main = "Rolling Bayesian Estimate: Unemployment Effect",
+     xlab = "Window End Date",
+     ylab = "Posterior Mean")
+
+lines(rolling_results$end_date, rolling_results$beta_unrate_low, lty = 2)
+lines(rolling_results$end_date, rolling_results$beta_unrate_high, lty = 2)
+abline(h = 0, lty = 3)
+```
+```{r}
+# Plot rolling coefficient value plot for Lagged GDP growth
+plot(rolling_results$end_date, rolling_results$beta_gdp_mean,
+     type = "l", lwd = 2,
+     ylim = range(c(rolling_results$beta_gdp_low,
+                    rolling_results$beta_gdp_high), na.rm = TRUE),
+     main = "Rolling Bayesian Estimate: Lagged GDP Growth Effect",
+     xlab = "Window End Date",
+     ylab = "Posterior Mean")
+
+lines(rolling_results$end_date, rolling_results$beta_gdp_low, lty = 2)
+lines(rolling_results$end_date, rolling_results$beta_gdp_high, lty = 2)
+abline(h = 0, lty = 3)
+```
+
+```{r}
+# Plot rolling coefficient value plot for Yield Spread
+plot(rolling_results$end_date, rolling_results$beta_spread_mean,
+     type = "l", lwd = 2,
+     ylim = range(c(rolling_results$beta_spread_low,
+                    rolling_results$beta_spread_high), na.rm = TRUE),
+     main = "Rolling Bayesian Estimate: Yield Spread Effect",
+     xlab = "Window End Date",
+     ylab = "Posterior Mean")
+
+lines(rolling_results$end_date, rolling_results$beta_spread_low, lty = 2)
+lines(rolling_results$end_date, rolling_results$beta_spread_high, lty = 2)
+abline(h = 0, lty = 3)
+```
+
+# 7.) PPC
+
+## Normal PPC
+```{r}
+# Posterior draws from normal Bayesian model
+post_norm <- as.matrix(as.mcmc(posterior_MLR))
+
+# Design matrix
+X_unscaled <- model.matrix(
+  ~ lag_gdp_growth + lag_unrate + lag_inflation + lag_ip_growth + lag_spread,
+  data = df_final
+)
+
+# Coefficient draws
+beta_draws_norm <- cbind(
+  post_norm[, "beta_0"],
+  post_norm[, "beta_gdp"],
+  post_norm[, "beta_unrate"],
+  post_norm[, "beta_inflation"],
+  post_norm[, "beta_ip"],
+  post_norm[, "beta_spread"]
+)
+
+# Posterior means for each observation
+mu_post_norm <- beta_draws_norm %*% t(X_unscaled)
+sigma_post_norm <- post_norm[, "sigma"]
+
+# Simulate replicated datasets
+set.seed(123)
+n_draws <- nrow(mu_post_norm)
+
+yrep_norm <- matrix(NA, nrow = n_draws, ncol = ncol(mu_post_norm))
+
+for (s in 1:n_draws) {
+  yrep_norm[s, ] <- rnorm(
+    n = ncol(mu_post_norm),
+    mean = mu_post_norm[s, ],
+    sd = sigma_post_norm[s]
+  )
+}
+```
+
+## T Bayesian PPC
+```{r}
+# Define constants for PPC sim
+set.seed(123)
+n_draws_t <- nrow(mu_post_t)
+
+# Posterior draws from t Bayesian model
+post_t <- as.matrix(as.mcmc(posterior_t_unscaled))
+
+# Combine draws
+beta_draws_t <- cbind(
+  post_t[, "beta_0"],
+  post_t[, "beta_gdp"],
+  post_t[, "beta_unrate"],
+  post_t[, "beta_inflation"],
+  post_t[, "beta_ip"],
+  post_t[, "beta_spread"]
+)
+
+# Compute and extract desired params
+mu_post_t <- beta_draws_t %*% t(X_unscaled)
+sigma_post_t <- post_t[, "sigma"]
+nu_post_t <- post_t[, "nu"]
+
+# Initialize predicted value storage
+yrep_t <- matrix(NA, nrow = n_draws_t, ncol = ncol(mu_post_t))
+
+# Populate PPC data matrix
+for (s in 1:n_draws_t) {
+  yrep_t[s, ] <- mu_post_t[s, ] + sigma_post_t[s] * rt(ncol(mu_post_t), df = nu_post_t[s])
+}
+```
+
+```{r}
+# Observed data
+y_obs <- df_final$gdp_growth
+
+# Define function that combines PPC metrics into summaries
+ppc_stats <- function(y) {
+  c(
+    mean = mean(y),
+    sd = sd(y),
+    min = min(y),
+    prop_negative = mean(y < 0),
+    n_extreme_neg = sum(y < -0.02)
+  )
+}
+
+# Summary for observed vals
+obs_stats <- ppc_stats(y_obs)
+
+# Summary for replications from normal model
+rep_stats_norm <- t(apply(yrep_norm, 1, ppc_stats))
+
+# Summary for replicated from t model
+rep_stats_t <- t(apply(yrep_t, 1, ppc_stats))
+```
+
+```{r}
+# Create table
+ppp_table <- data.frame(
+  Statistic = names(obs_stats),
+  Observed = as.numeric(obs_stats),
+  PPP_Normal = sapply(1:length(obs_stats), function(j) mean(rep_stats_norm[, j] >= obs_stats[j])),
+  PPP_t = sapply(1:length(obs_stats), function(j) mean(rep_stats_t[, j] >= obs_stats[j]))
+)
+
+# DIsplay table
+knitr::kable(
+  ppp_table,
+  digits = 4,
+  caption = "Posterior predictive checks for Bayesian normal and Bayesian t models"
+)
+```
+
+```{r}
+# Plot histogram of minimum GDP growth for normal model
+hist(rep_stats_norm[, "min"],
+     main = "Posterior Predictive Check: Minimum GDP Growth",
+     xlab = "Replicated minimum GDP growth")
+abline(v = obs_stats["min"], lwd = 2, lty = 2)
+
+# Plot histogram of minimum GDP growth for t model
+hist(rep_stats_t[, "min"],
+     main = "Posterior Predictive Check: Minimum GDP Growth (t model)",
+     xlab = "Replicated minimum GDP growth")
+abline(v = obs_stats["min"], lwd = 2, lty = 2)
+```
+
+```{r}
+# Plot histogram for number of extreme negative GDP Quarters for normal model
+hist(rep_stats_norm[, "n_extreme_neg"],
+     main = "PPC: Number of Extreme Negative GDP Quarters (Normal)",
+     xlab = "Replicated count")
+abline(v = obs_stats["n_extreme_neg"], lwd = 2, lty = 2)
+
+# Plot histogram for number of extreme negative GDP Quarters for t model
+hist(rep_stats_t[, "n_extreme_neg"],
+     main = "PPC: Number of Extreme Negative GDP Quarters (t)",
+     xlab = "Replicated count")
+abline(v = obs_stats["n_extreme_neg"], lwd = 2, lty = 2)
+```
+
+```{r}
+# Threshold for extreme recession
+extreme_cutoff <- -0.02
+
+# Frequentist probability of extreme negative GDP
+freq_extreme_prob <- pnorm(
+  extreme_cutoff,
+  mean = mu_hat,
+  sd = pred_sd
+)
+
+# Bayesian t-model probability (you already have draws)
+bayes_t_extreme_prob <- sapply(1:ncol(mu_draws_t), function(j) {
+  mean(pt((extreme_cutoff - mu_draws_t[, j]) / sigma_draws_t, df = nu_draws_t))
+})
+
+# Plot comparison
+plot(df_final$date, freq_extreme_prob,
+     type = "l",
+     lwd = 2,
+     col = "black",
+     ylim = range(c(freq_extreme_prob, bayes_t_extreme_prob), na.rm = TRUE),
+     main = "Extreme Negative GDP Risk: Normal vs t-Model",
+     xlab = "Quarter",
+     ylab = "Probability (GDP < -2%)")
+
+lines(df_final$date, bayes_t_extreme_prob,
+      col = "red",
+      lwd = 2,
+      lty = 2)
+
+legend("topright",
+       legend = c("Frequentist (Normal)", "Bayesian t-model"),
+       col = c("black", "red"),
+       lwd = 2,
+       lty = c(1, 2),
+       bty = "n")
+```
+
+```{r}
+############################################################
+# Residual Distribution: Normal vs t Fit
+############################################################
+
+library(MASS)
+
+# Residuals from frequentist model
+residuals_freq <- resid(freq_mod_unscaled)
+residuals_freq <- residuals_freq[is.finite(residuals_freq)]
+
+# Normal fit
+mu_norm <- mean(residuals_freq)
+sd_norm <- sd(residuals_freq)
+
+# t fit with warning suppression
+t_fit <- suppressWarnings(
+  fitdistr(
+    residuals_freq,
+    densfun = "t",
+    start = list(
+      m = median(residuals_freq),
+      s = sd(residuals_freq),
+      df = 4
+    )
+  )
+)
+
+# Extract t parameters
+mu_t <- t_fit$estimate["m"]
+sigma_t <- t_fit$estimate["s"]
+nu_t <- t_fit$estimate["df"]
+
+cat("t-distribution parameters:\n")
+cat("mu =", mu_t, "\n")
+cat("sigma =", sigma_t, "\n")
+cat("nu (df) =", nu_t, "\n")
+
+# Grid for density curves
+x_grid <- seq(min(residuals_freq),
+              max(residuals_freq),
+              length.out = 500)
+
+# Normal density
+dens_norm <- dnorm(x_grid, mean = mu_norm, sd = sd_norm)
+
+# t density
+z_vals <- (x_grid - mu_t) / sigma_t
+dens_t <- dt(z_vals, df = nu_t) / sigma_t
+dens_t[!is.finite(dens_t)] <- 0
+
+# Plot
+hist(residuals_freq,
+     breaks = 40,
+     probability = TRUE,
+     col = "lightgray",
+     border = "white",
+     main = "Residual Distribution: Normal vs t Fit",
+     xlab = "Residuals")
+
+lines(x_grid, dens_norm,
+      col = "black",
+      lwd = 2)
+
+lines(x_grid, dens_t,
+      col = "red",
+      lwd = 2,
+      lty = 2)
+
+legend("topright",
+       legend = c("Normal Fit", "t Fit"),
+       col = c("black", "red"),
+       lwd = 2,
+       lty = c(1, 2),
+       bty = "n")
+```
+
